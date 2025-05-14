@@ -1,6 +1,7 @@
 import re
+from typing import Optional
 
-def extract_wave_number(wave_text):
+def extract_wave_number(wave_text: Optional[str]) -> Optional[int]:
     if not wave_text:
         return None
    
