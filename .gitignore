@@ -1,5 +1,15 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
 gameservers.db
-ov/main.py
 gameservers.db-wal
 gameservers.db-shm
-logs/server_monitor_2025-05-14.log
+
+logs/
+*.log
+
+ov/main.py
