@@ -11,5 +11,3 @@ gameservers.db-shm
 
 logs/
 *.log
-
-ov/main.py
