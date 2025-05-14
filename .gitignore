@@ -1,0 +1,5 @@
+gameservers.db
+ov/main.py
+gameservers.db-wal
+gameservers.db-shm
+logs/server_monitor_2025-05-14.log
