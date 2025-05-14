@@ -25,11 +25,38 @@ def update_player_record(session_id, steam_id, player_name, team_id, score, is_b
             previous_team_id = player['team_id']
             
             if previous_team_id != team_id and previous_team_id is not None and team_id is not None:
+                execute_with_retry(cursor, '''
+                SELECT id FROM player_team_scores 
+                WHERE player_id = ? AND team_id = ? AND session_id = ?
+                ''', (player_id, previous_team_id, session_id))
+                
+                team_score_record = cursor.fetchone()
+                
+                if team_score_record:
+                    execute_with_retry(cursor, '''
+                    UPDATE player_team_scores 
+                    SET final_score = ?, last_updated = ?
+                    WHERE id = ?
+                    ''', (current_score, timestamp, team_score_record['id']))
+                else:
+                    execute_with_retry(cursor, '''
+                    INSERT INTO player_team_scores 
+                    (player_id, session_id, team_id, initial_score, final_score, first_seen, last_updated)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ''', (player_id, session_id, previous_team_id, player['initial_score'], current_score, player['first_seen'], timestamp))
+                
                 conn.commit()
                 conn.close()
-                log_player_team_change(session_id, player_id, player_name, previous_team_id, team_id, timestamp)
+                log_player_team_change(session_id, player_id, player_name, previous_team_id, team_id, timestamp, current_score)
+                
                 conn = get_db_connection()
                 cursor = conn.cursor()
+                
+                execute_with_retry(cursor, '''
+                INSERT OR IGNORE INTO player_team_scores 
+                (player_id, session_id, team_id, initial_score, final_score, first_seen, last_updated)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (player_id, session_id, team_id, score, score, timestamp, timestamp))
             
             if score != current_score:
                 execute_with_retry(cursor, '''
@@ -37,6 +64,27 @@ def update_player_record(session_id, steam_id, player_name, team_id, score, is_b
                 SET current_score = ?, highest_score = ?, last_seen = ?, player_name = ?, team_id = ?
                 WHERE id = ?
                 ''', (score, highest_score, timestamp, player_name, team_id, player_id))
+                
+                if team_id is not None:
+                    execute_with_retry(cursor, '''
+                    SELECT id FROM player_team_scores 
+                    WHERE player_id = ? AND team_id = ? AND session_id = ?
+                    ''', (player_id, team_id, session_id))
+                    
+                    team_score_record = cursor.fetchone()
+                    
+                    if team_score_record:
+                        execute_with_retry(cursor, '''
+                        UPDATE player_team_scores 
+                        SET final_score = ?, last_updated = ?
+                        WHERE id = ?
+                        ''', (score, timestamp, team_score_record['id']))
+                    else:
+                        execute_with_retry(cursor, '''
+                        INSERT INTO player_team_scores 
+                        (player_id, session_id, team_id, initial_score, final_score, first_seen, last_updated)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ''', (player_id, session_id, team_id, score, score, timestamp, timestamp))
                 
                 if abs(score - current_score) > 5:
                     execute_with_retry(cursor, '''
@@ -60,6 +108,13 @@ def update_player_record(session_id, steam_id, player_name, team_id, score, is_b
             
             player_id = cursor.lastrowid
             
+            if team_id is not None:
+                execute_with_retry(cursor, '''
+                INSERT INTO player_team_scores 
+                (player_id, session_id, team_id, initial_score, final_score, first_seen, last_updated)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (player_id, session_id, team_id, score, score, timestamp, timestamp))
+            
             execute_with_retry(cursor, '''
             INSERT INTO score_history (player_id, timestamp, score)
             VALUES (?, ?, ?)
@@ -74,7 +129,7 @@ def update_player_record(session_id, steam_id, player_name, team_id, score, is_b
     finally:
         conn.close()
 
-def log_player_team_change(session_id, player_id, player_name, old_team_id, new_team_id, timestamp):
+def log_player_team_change(session_id, player_id, player_name, old_team_id, new_team_id, timestamp, current_score=None):
     if not session_id:
         return
         
@@ -102,9 +157,9 @@ def log_player_team_change(session_id, player_id, player_name, old_team_id, new_
         
         execute_with_retry(cursor, '''
         INSERT INTO player_team_changes
-        (player_id, session_id, old_team_id, new_team_id, timestamp, wave_text, wave_number, is_death, is_redeem)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (player_id, session_id, old_team_id, new_team_id, timestamp, wave_text, wave_number, is_death, is_redeem))
+        (player_id, session_id, old_team_id, new_team_id, timestamp, wave_text, wave_number, is_death, is_redeem, score_at_change)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (player_id, session_id, old_team_id, new_team_id, timestamp, wave_text, wave_number, is_death, is_redeem, current_score))
         
         conn.commit()
         
@@ -125,7 +180,33 @@ def update_player_playtimes(session_id, end_time):
     if not session_id:
         return
     
-    # First, fetch all players in this session
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        execute_with_retry(cursor, '''
+        CREATE TABLE IF NOT EXISTS player_team_scores (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            player_id INTEGER NOT NULL,
+            session_id INTEGER NOT NULL,
+            team_id INTEGER NOT NULL,
+            initial_score INTEGER NOT NULL DEFAULT 0,
+            final_score INTEGER NOT NULL DEFAULT 0,
+            first_seen TEXT NOT NULL,
+            last_updated TEXT NOT NULL,
+            UNIQUE(player_id, session_id, team_id),
+            FOREIGN KEY (player_id) REFERENCES player_records (id),
+            FOREIGN KEY (session_id) REFERENCES game_sessions (id)
+        )
+        ''')
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        logging.error(f"Error creating player_team_scores table: {str(e)}")
+        return
+    
     conn = get_db_connection()
     cursor = conn.cursor()
     
@@ -155,8 +236,8 @@ def update_player_playtimes(session_id, end_time):
                 
             steam_id = player['steam_id']
             player_name = player['player_name']
-            team_id = player['team_id']
-            score = player['current_score']
+            current_team_id = player['team_id']
+            current_score = player['current_score']
             
             first_seen = datetime.fromisoformat(player['first_seen'])
             last_seen = datetime.fromisoformat(player['last_seen'])
@@ -189,9 +270,45 @@ def update_player_playtimes(session_id, end_time):
                 
                 player_stats = cursor.fetchone()
                 
+                execute_with_retry(cursor, '''
+                SELECT team_id, final_score - initial_score AS score_earned
+                FROM player_team_scores
+                WHERE player_id = ? AND session_id = ?
+                ''', (player['id'], session_id))
+                
+                team_scores = cursor.fetchall()
+                total_session_score = 0
+                
+                if team_scores:
+                    for ts in team_scores:
+                        total_session_score += ts['score_earned']
+                else:
+                    total_session_score = current_score
+                
+                if current_team_id is not None:
+                    execute_with_retry(cursor, '''
+                    SELECT id FROM player_team_scores
+                    WHERE player_id = ? AND session_id = ? AND team_id = ?
+                    ''', (player['id'], session_id, current_team_id))
+                    
+                    team_score_record = cursor.fetchone()
+                    
+                    if team_score_record:
+                        execute_with_retry(cursor, '''
+                        UPDATE player_team_scores 
+                        SET final_score = ?, last_updated = ?
+                        WHERE id = ?
+                        ''', (current_score, end_time, team_score_record['id']))
+                    else:
+                        execute_with_retry(cursor, '''
+                        INSERT INTO player_team_scores 
+                        (player_id, session_id, team_id, initial_score, final_score, first_seen, last_updated)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ''', (player['id'], session_id, current_team_id, 0, current_score, first_seen.isoformat(), end_time))
+                
                 if player_stats:
                     stats_id = player_stats['id']
-                    total_score = player_stats['total_score'] + score
+                    total_score = player_stats['total_score'] + total_session_score
                     total_playtime = player_stats['total_playtime_seconds'] + playtime_seconds
                     session_count = player_stats['session_count'] + 1
                     
@@ -206,36 +323,45 @@ def update_player_playtimes(session_id, end_time):
                     INSERT INTO player_stats
                     (steam_id, player_name, total_score, total_playtime_seconds, session_count, last_updated)
                     VALUES (?, ?, ?, ?, 1, ?)
-                    ''', (steam_id, player_name, score, playtime_seconds, end_time))
+                    ''', (steam_id, player_name, total_session_score, playtime_seconds, end_time))
                     
                     stats_id = cursor.lastrowid
                 
                 conn.commit()
                 conn.close()
                 
-                # Update team stats if player had a team
-                if team_id is not None:
-                    conn = get_db_connection()
-                    cursor = conn.cursor()
+                conn = get_db_connection()
+                cursor = conn.cursor()
+                
+                try:
+                    execute_with_retry(cursor, '''
+                    CREATE TABLE IF NOT EXISTS player_team_stats (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        player_stats_id INTEGER NOT NULL,
+                        team_id INTEGER NOT NULL,
+                        team_name TEXT NOT NULL,
+                        score INTEGER NOT NULL DEFAULT 0,
+                        playtime_seconds INTEGER NOT NULL DEFAULT 0,
+                        last_updated TEXT NOT NULL,
+                        UNIQUE(player_stats_id, team_id),
+                        FOREIGN KEY (player_stats_id) REFERENCES player_stats (id)
+                    )
+                    ''')
                     
-                    try:
-                        # Ensure player_team_stats table exists
-                        execute_with_retry(cursor, '''
-                        CREATE TABLE IF NOT EXISTS player_team_stats (
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            player_stats_id INTEGER NOT NULL,
-                            team_id INTEGER NOT NULL,
-                            team_name TEXT NOT NULL,
-                            score INTEGER NOT NULL DEFAULT 0,
-                            playtime_seconds INTEGER NOT NULL DEFAULT 0,
-                            last_updated TEXT NOT NULL,
-                            UNIQUE(player_stats_id, team_id),
-                            FOREIGN KEY (player_stats_id) REFERENCES player_stats (id)
-                        )
-                        ''')
+                    execute_with_retry(cursor, '''
+                    SELECT team_id, final_score - initial_score AS score_earned
+                    FROM player_team_scores
+                    WHERE player_id = ? AND session_id = ?
+                    ''', (player['id'], session_id))
+                    
+                    team_scores = cursor.fetchall()
+                    
+                    for ts in team_scores:
+                        team_id = ts['team_id']
+                        score_earned = ts['score_earned']
                         
                         execute_with_retry(cursor, '''
-                        SELECT id, team_name FROM team_status
+                        SELECT team_name FROM team_status
                         WHERE session_id = ? AND team_id = ?
                         ORDER BY timestamp DESC LIMIT 1
                         ''', (session_id, team_id))
@@ -243,6 +369,7 @@ def update_player_playtimes(session_id, end_time):
                         team_info = cursor.fetchone()
                         team_name = team_info['team_name'] if team_info else f'Team {team_id}'
                         
+                        # Get existing team stats
                         execute_with_retry(cursor, '''
                         SELECT id, score, playtime_seconds
                         FROM player_team_stats
@@ -251,30 +378,31 @@ def update_player_playtimes(session_id, end_time):
                         
                         team_stats = cursor.fetchone()
                         
+                        team_playtime = int(playtime_seconds / len(team_scores))  # Simple distribution
+                        
                         if team_stats:
-                            team_score = team_stats['score'] + score
-                            team_playtime = team_stats['playtime_seconds'] + playtime_seconds
+                            team_score = team_stats['score'] + score_earned
+                            team_playtime_total = team_stats['playtime_seconds'] + team_playtime
                             
                             execute_with_retry(cursor, '''
                             UPDATE player_team_stats
                             SET score = ?, playtime_seconds = ?, team_name = ?, last_updated = ?
                             WHERE id = ?
-                            ''', (team_score, team_playtime, team_name, end_time, team_stats['id']))
+                            ''', (team_score, team_playtime_total, team_name, end_time, team_stats['id']))
                         else:
                             execute_with_retry(cursor, '''
                             INSERT INTO player_team_stats
                             (player_stats_id, team_id, team_name, score, playtime_seconds, last_updated)
                             VALUES (?, ?, ?, ?, ?, ?)
-                            ''', (stats_id, team_id, team_name, score, playtime_seconds, end_time))
-                        
-                        conn.commit()
-                    except Exception as e:
-                        conn.rollback()
-                        logging.error(f"Error updating team stats for player {player_name} in team {team_id}: {str(e)}")
-                    finally:
-                        conn.close()
-                
-                processed_count += 1
+                            ''', (stats_id, team_id, team_name, score_earned, team_playtime, end_time))
+                    
+                    conn.commit()
+                    processed_count += 1
+                except Exception as e:
+                    conn.rollback()
+                    logging.error(f"Error updating team stats for player {player_name}: {str(e)}")
+                finally:
+                    conn.close()
                 
             except Exception as e:
                 if conn:

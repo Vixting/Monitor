@@ -1,5 +1,6 @@
 import logging
 import sqlite3
+from datetime import datetime
 import time
 
 DB_FILE = "gameservers.db"
@@ -262,6 +263,36 @@ def migrate_database():
     conn = get_db_connection()
     cursor = conn.cursor()
     
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='player_team_scores'")
+    if not cursor.fetchone():
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS player_team_scores (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            player_id INTEGER NOT NULL,
+            session_id INTEGER NOT NULL,
+            team_id INTEGER NOT NULL,
+            initial_score INTEGER NOT NULL DEFAULT 0,
+            final_score INTEGER NOT NULL DEFAULT 0,
+            first_seen TEXT NOT NULL,
+            last_updated TEXT NOT NULL,
+            UNIQUE(player_id, session_id, team_id),
+            FOREIGN KEY (player_id) REFERENCES player_records (id),
+            FOREIGN KEY (session_id) REFERENCES game_sessions (id)
+        )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_player_team_scores_player ON player_team_scores(player_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_player_team_scores_session ON player_team_scores(session_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_player_team_scores_team ON player_team_scores(team_id)')
+        logging.info("Created player_team_scores table")
+    
+    cursor.execute("PRAGMA table_info(player_team_changes)")
+    columns = cursor.fetchall()
+    column_names = [col[1] for col in columns]
+    
+    if 'score_at_change' not in column_names:
+        cursor.execute('ALTER TABLE player_team_changes ADD COLUMN score_at_change INTEGER')
+        logging.info("Added score_at_change column to player_team_changes table")
+    
     cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='player_team_changes'")
     if not cursor.fetchone():
         cursor.execute('''
@@ -276,6 +307,7 @@ def migrate_database():
             wave_number INTEGER,
             is_death BOOLEAN NOT NULL DEFAULT 0,
             is_redeem BOOLEAN NOT NULL DEFAULT 0,
+            score_at_change INTEGER,
             FOREIGN KEY (player_id) REFERENCES player_records (id),
             FOREIGN KEY (session_id) REFERENCES game_sessions (id)
         )
