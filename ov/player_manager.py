@@ -11,52 +11,72 @@ def update_player_record(session_id, steam_id, player_name, team_id, score, is_b
     
     try:
         execute_with_retry(cursor, '''
-        SELECT id, initial_score, highest_score, current_score, team_id
-        FROM player_records 
+        SELECT * FROM player_records 
         WHERE session_id = ? AND steam_id = ?
         ''', (session_id, steam_id))
         
         player = cursor.fetchone()
         
         if player:
+            logging.debug(f"Player record keys for {player_name}: {list(player.keys())}")
+            
             player_id = player['id']
             highest_score = max(player['highest_score'], score)
             current_score = player['current_score']
             previous_team_id = player['team_id']
             
+            initial_score = player['initial_score'] if 'initial_score' in player else score
+            first_seen = player['first_seen'] if 'first_seen' in player else timestamp
+            
             if previous_team_id != team_id and previous_team_id is not None and team_id is not None:
-                execute_with_retry(cursor, '''
-                SELECT id FROM player_team_scores 
-                WHERE player_id = ? AND team_id = ? AND session_id = ?
-                ''', (player_id, previous_team_id, session_id))
+                logging.info(f"Team change detected for {player_name}: {previous_team_id} -> {team_id}")
                 
-                team_score_record = cursor.fetchone()
-                
-                if team_score_record:
+                try:
                     execute_with_retry(cursor, '''
-                    UPDATE player_team_scores 
-                    SET final_score = ?, last_updated = ?
-                    WHERE id = ?
-                    ''', (current_score, timestamp, team_score_record['id']))
-                else:
+                    SELECT id FROM player_team_scores 
+                    WHERE player_id = ? AND team_id = ? AND session_id = ?
+                    ''', (player_id, previous_team_id, session_id))
+                    
+                    team_score_record = cursor.fetchone()
+                    
+                    if team_score_record and 'id' in team_score_record:
+                        execute_with_retry(cursor, '''
+                        UPDATE player_team_scores 
+                        SET final_score = ?, last_updated = ?
+                        WHERE id = ?
+                        ''', (current_score, timestamp, team_score_record['id']))
+                    else:
+                        execute_with_retry(cursor, '''
+                        INSERT OR IGNORE INTO player_team_scores 
+                        (player_id, session_id, team_id, initial_score, final_score, first_seen, last_updated)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ''', (player_id, session_id, previous_team_id, initial_score, current_score, first_seen, timestamp))
+                    
+                    conn.commit()
+                    conn.close()
+                    
+                    log_player_team_change(session_id, player_id, player_name, previous_team_id, team_id, timestamp, current_score)
+                    
+                    conn = get_db_connection()
+                    cursor = conn.cursor()
+                    
                     execute_with_retry(cursor, '''
-                    INSERT INTO player_team_scores 
-                    (player_id, session_id, team_id, initial_score, final_score, first_seen, last_updated)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ''', (player_id, session_id, previous_team_id, player['initial_score'], current_score, player['first_seen'], timestamp))
-                
-                conn.commit()
-                conn.close()
-                log_player_team_change(session_id, player_id, player_name, previous_team_id, team_id, timestamp, current_score)
-                
-                conn = get_db_connection()
-                cursor = conn.cursor()
-                
-                execute_with_retry(cursor, '''
-                INSERT OR IGNORE INTO player_team_scores 
-                (player_id, session_id, team_id, initial_score, final_score, first_seen, last_updated)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ''', (player_id, session_id, team_id, score, score, timestamp, timestamp))
+                    SELECT id FROM player_team_scores 
+                    WHERE player_id = ? AND team_id = ? AND session_id = ?
+                    ''', (player_id, team_id, session_id))
+                    
+                    team_record_exists = cursor.fetchone()
+                    
+                    if not team_record_exists:
+                        execute_with_retry(cursor, '''
+                        INSERT OR IGNORE INTO player_team_scores 
+                        (player_id, session_id, team_id, initial_score, final_score, first_seen, last_updated)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ''', (player_id, session_id, team_id, score, score, timestamp, timestamp))
+                except Exception as e:
+                    logging.error(f"Error handling team change for player {player_name} in session {session_id}: {str(e)}")
+                    import traceback
+                    logging.error(f"Traceback: {traceback.format_exc()}")
             
             if score != current_score:
                 execute_with_retry(cursor, '''
@@ -66,25 +86,28 @@ def update_player_record(session_id, steam_id, player_name, team_id, score, is_b
                 ''', (score, highest_score, timestamp, player_name, team_id, player_id))
                 
                 if team_id is not None:
-                    execute_with_retry(cursor, '''
-                    SELECT id FROM player_team_scores 
-                    WHERE player_id = ? AND team_id = ? AND session_id = ?
-                    ''', (player_id, team_id, session_id))
-                    
-                    team_score_record = cursor.fetchone()
-                    
-                    if team_score_record:
+                    try:
                         execute_with_retry(cursor, '''
-                        UPDATE player_team_scores 
-                        SET final_score = ?, last_updated = ?
-                        WHERE id = ?
-                        ''', (score, timestamp, team_score_record['id']))
-                    else:
-                        execute_with_retry(cursor, '''
-                        INSERT INTO player_team_scores 
-                        (player_id, session_id, team_id, initial_score, final_score, first_seen, last_updated)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                        ''', (player_id, session_id, team_id, score, score, timestamp, timestamp))
+                        SELECT id FROM player_team_scores 
+                        WHERE player_id = ? AND team_id = ? AND session_id = ?
+                        ''', (player_id, team_id, session_id))
+                        
+                        team_score_record = cursor.fetchone()
+                        
+                        if team_score_record and 'id' in team_score_record:
+                            execute_with_retry(cursor, '''
+                            UPDATE player_team_scores 
+                            SET final_score = ?, last_updated = ?
+                            WHERE id = ?
+                            ''', (score, timestamp, team_score_record['id']))
+                        else:
+                            execute_with_retry(cursor, '''
+                            INSERT OR IGNORE INTO player_team_scores 
+                            (player_id, session_id, team_id, initial_score, final_score, first_seen, last_updated)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                            ''', (player_id, session_id, team_id, score, score, timestamp, timestamp))
+                    except Exception as e:
+                        logging.error(f"Error updating team scores for player {player_name} in session {session_id}: {str(e)}")
                 
                 if abs(score - current_score) > 5:
                     execute_with_retry(cursor, '''
@@ -109,11 +132,14 @@ def update_player_record(session_id, steam_id, player_name, team_id, score, is_b
             player_id = cursor.lastrowid
             
             if team_id is not None:
-                execute_with_retry(cursor, '''
-                INSERT INTO player_team_scores 
-                (player_id, session_id, team_id, initial_score, final_score, first_seen, last_updated)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ''', (player_id, session_id, team_id, score, score, timestamp, timestamp))
+                try:
+                    execute_with_retry(cursor, '''
+                    INSERT OR IGNORE INTO player_team_scores 
+                    (player_id, session_id, team_id, initial_score, final_score, first_seen, last_updated)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ''', (player_id, session_id, team_id, score, score, timestamp, timestamp))
+                except Exception as e:
+                    logging.error(f"Error creating team score record for new player {player_name} in session {session_id}: {str(e)}")
             
             execute_with_retry(cursor, '''
             INSERT INTO score_history (player_id, timestamp, score)
@@ -126,6 +152,8 @@ def update_player_record(session_id, steam_id, player_name, team_id, score, is_b
     except Exception as e:
         conn.rollback()
         logging.error(f"Database error updating player record for {steam_id} in session {session_id}: {str(e)}")
+        import traceback
+        logging.error(f"Traceback: {traceback.format_exc()}")
     finally:
         conn.close()
 
@@ -137,13 +165,30 @@ def log_player_team_change(session_id, player_id, player_name, old_team_id, new_
     cursor = conn.cursor()
     
     try:
+        logging.debug(f"Inside log_player_team_change for {player_name}: {old_team_id} -> {new_team_id}")
+        
         execute_with_retry(cursor, '''
         SELECT wave_text, wave_number FROM game_sessions WHERE id = ?
         ''', (session_id,))
         
         session_data = cursor.fetchone()
-        wave_text = session_data['wave_text'] if session_data else "Unknown"
-        wave_number = session_data['wave_number'] if session_data else None
+        
+        # Log available keys in session data
+        if session_data:
+            logging.debug(f"Session data keys: {list(session_data.keys())}")
+        else:
+            logging.debug(f"No session data found for session_id {session_id}")
+        
+        # Safely access the keys in session_data
+        if session_data:
+            keys = list(session_data.keys())
+            wave_text = session_data['wave_text'] if 'wave_text' in keys else "Unknown"
+            wave_number = session_data['wave_number'] if 'wave_number' in keys else None
+            logging.debug(f"Extracted wave_text: {wave_text}, wave_number: {wave_number}")
+        else:
+            wave_text = "Unknown"
+            wave_number = None
+            logging.debug("Using default wave_text and wave_number values")
         
         is_death = 0
         is_redeem = 0
@@ -173,6 +218,9 @@ def log_player_team_change(session_id, player_id, player_name, old_team_id, new_
     except Exception as e:
         conn.rollback()
         logging.error(f"Error logging player team change for player {player_name}: {str(e)}")
+        # Add more detailed error info
+        import traceback
+        logging.error(f"Traceback details: {traceback.format_exc()}")
     finally:
         conn.close()
 
