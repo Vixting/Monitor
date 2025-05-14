@@ -281,7 +281,8 @@ def update_player_playtimes(session_id, end_time):
                 
                 if team_scores:
                     for ts in team_scores:
-                        total_session_score += ts['score_earned']
+                        if ts['score_earned'] is not None:
+                            total_session_score += ts['score_earned']
                 else:
                     total_session_score = current_score
                 
@@ -367,7 +368,7 @@ def update_player_playtimes(session_id, end_time):
                         ''', (session_id, team_id))
                         
                         team_info = cursor.fetchone()
-                        team_name = team_info['team_name'] if team_info else f'Team {team_id}'
+                        team_name = team_info['team_name'] if team_info and 'team_name' in team_info else f'Team {team_id}'
                         
                         # Get existing team stats
                         execute_with_retry(cursor, '''
@@ -378,9 +379,9 @@ def update_player_playtimes(session_id, end_time):
                         
                         team_stats = cursor.fetchone()
                         
-                        team_playtime = int(playtime_seconds / len(team_scores))  # Simple distribution
+                        team_playtime = int(playtime_seconds / max(1, len(team_scores)))  # prevent / 0
                         
-                        if team_stats:
+                        if team_stats and 'score' in team_stats and 'playtime_seconds' in team_stats:
                             team_score = team_stats['score'] + score_earned
                             team_playtime_total = team_stats['playtime_seconds'] + team_playtime
                             
@@ -497,7 +498,7 @@ def update_death_statistics(session_id):
                 
                 processed_count += 1
             except Exception as e:
-                logging.error(f"Error updating death statistics for player {death.get('player_name', 'Unknown')}: {str(e)}")
+                logging.error(f"Error updating death statistics for player {death['player_name'] if 'player_name' in death else 'Unknown'}: {str(e)}")
         
         conn.commit()
         conn.close()
@@ -578,7 +579,7 @@ def update_death_statistics(session_id):
                 
                 redeem_count += 1
             except Exception as e:
-                logging.error(f"Error updating redeem statistics for player {redeem.get('player_name', 'Unknown')}: {str(e)}")
+                logging.error(f"Error updating redeem statistics for player {redeem['player_name'] if 'player_name' in redeem else 'Unknown'}: {str(e)}")
         
         conn.commit()
         conn.close()
